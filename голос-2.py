@@ -82,10 +82,29 @@ class RobotLogic:
                     {"type": "text", "text": "Is there a yellow ball here? Answer JSON {'seen':bool}"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
                 ]}], "max_tokens": 50}, timeout=5.0)
-            res = json.loads(r.json()['choices'][0]['message']['content'].replace("```json", "").replace("```", ""))
+            r.raise_for_status()
+            content = r.json()['choices'][0]['message']['content']
+            res = self._parse_llm_json(content)
             self.ai_confirmed = res.get("seen", False)
         except: 
             pass
+
+    @staticmethod
+    def _parse_llm_json(content):
+        if not content:
+            return {}
+        text = content.replace("```json", "").replace("```", "").strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        # Если модель вернула псевдо-JSON c одинарными кавычками: {'seen': true}
+        text = text.replace("'", '"')
+        try:
+            return json.loads(text)
+        except Exception:
+            return {}
 
     def move(self, action, pulses=1):
         try:
