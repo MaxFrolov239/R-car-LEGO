@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -186,6 +187,7 @@ struct Config {
     double turn_strong = 0.35;
     double turn_flip = 0.22;
     double close_area_ratio = 0.07;
+    double close_unlock_area_ratio = 0.18;
     double turn_deadband_close = 0.22;
     double turn_exit_close = 0.16;
     double turn_strong_close = 0.48;
@@ -193,7 +195,9 @@ struct Config {
     double goal_area_ratio = 0.33;
     double goal_near_area_ratio = 0.12;
     double goal_near_center_offset = 0.20;
-    double goal_near_conf_min = 0.78;
+    double goal_near_conf_min = 0.68;
+    double goal_near_force_area_ratio = 0.22;
+    double goal_near_force_offset = 0.24;
     double stuck_diff = 3.0;
     double hud_font_scale = 0.42;
     double fast_min_area_ratio = 0.0025;
@@ -237,7 +241,10 @@ struct Config {
     int search_hold_ms = 380;
     int target_lock_frames = 3;
     int target_unlock_frames = 30;
+    int target_unlock_frames_close = 70;
     int target_stale_ms = 2600;
+    int target_stale_ms_close = 4500;
+    int close_blind_hold_lost_frames = 6;
     int reacquire_hold_ms = 700;
     double reacquire_min_area = 0.045;
     double reacquire_max_abs_offset = 0.30;
@@ -653,14 +660,42 @@ std::optional<Detection> parse_detection(const std::string& text, cv::Size frame
 
     Detection d;
     d.valid = true;
-    std::regex ball_re(R"("ball"\s*:\s*(true|false))", std::regex::icase);
-    std::regex seen_re(R"("seen"\s*:\s*(true|false))", std::regex::icase);
-    if (std::regex_search(payload, m, ball_re)) {
-        d.ball = (m[1].str() == "true" || m[1].str() == "TRUE" || m[1].str() == "True");
-    } else if (std::regex_search(payload, m, seen_re)) {
-        d.ball = (m[1].str() == "true" || m[1].str() == "TRUE" || m[1].str() == "True");
+    auto parse_bool_token = [](std::string token, bool& value) -> bool {
+        token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char ch) {
+            return std::isspace(ch) != 0;
+        }), token.end());
+        if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
+            token = token.substr(1, token.size() - 2);
+        }
+        std::string norm;
+        norm.reserve(token.size());
+        for (char ch : token) {
+            norm.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (norm == "true" || norm == "1") {
+            value = true;
+            return true;
+        }
+        if (norm == "false" || norm == "0") {
+            value = false;
+            return true;
+        }
+        return false;
+    };
+
+    std::regex ball_re(R"("ball"\s*:\s*(true|false|1|0|"true"|"false"|"1"|"0"))", std::regex::icase);
+    std::regex seen_re(R"("seen"\s*:\s*(true|false|1|0|"true"|"false"|"1"|"0"))", std::regex::icase);
+    bool parsed = false;
+    bool parsed_value = false;
+    if (std::regex_search(payload, m, ball_re) && parse_bool_token(m[1].str(), parsed_value)) {
+        d.ball = parsed_value;
+        parsed = true;
+    } else if (std::regex_search(payload, m, seen_re) && parse_bool_token(m[1].str(), parsed_value)) {
+        d.ball = parsed_value;
         d.source = "vlm_seen";
-    } else {
+        parsed = true;
+    }
+    if (!parsed) {
         return std::nullopt;
     }
 
@@ -719,11 +754,17 @@ private:
                 f = pending_.clone();
                 has_pending_ = false;
             }
+            Detection out;
+            out.valid = false;
+            out.ball = false;
+            out.source = "vlm_none";
             const auto r = client_.infer(f);
             last = now_ms();
-            if (!r.has_value()) continue;
+            if (r.has_value()) {
+                out = *r;
+            }
             std::lock_guard<std::mutex> lk(mu_);
-            out_ = *r;
+            out_ = out;
             has_out_ = true;
         }
     }
@@ -938,6 +979,7 @@ private:
     }
 
     std::string summary_line(int64_t t) const {
+        const int64_t vlm_fresh_ms = (last_vlm_rx_ms_ > 0) ? (t - last_vlm_rx_ms_) : -1;
         std::ostringstream oss;
         oss << "phase=" << phase_
             << " auto=" << (auto_ ? "ON" : "OFF")
@@ -949,6 +991,7 @@ private:
             << " src=" << (has_target_ ? target_.source : "none")
             << " conf=" << fmt_double(has_target_ ? target_.conf : 0.0, 2)
             << " aiSeen=" << (ai_confirm_recent_ ? "1" : "0")
+            << " vlmFreshMs=" << vlm_fresh_ms
             << " off=" << fmt_double(last_offset_, 3)
             << " area=" << fmt_double(last_area_ratio_, 3)
             << " frameAge=" << frame_age_ms_
@@ -956,6 +999,7 @@ private:
             << " turn=" << turn_state_
             << " goalLatched=" << (goal_latched_ ? "1" : "0")
             << " stuck=" << stuck_count_
+            << " unlock_reason=" << unlock_reason_
             << " decision=" << decision_reason_;
         return oss.str();
     }
@@ -1124,12 +1168,21 @@ private:
                 target_ = candidate.value();
                 last_target_ms_ = t;
                 lost_ = 0;
+                unlock_reason_ = "none";
                 has_candidate_ = false;
                 candidate_count_ = 0;
                 decision_reason_ = std::string("track:update_") + target_.source;
             } else {
                 ++lost_;
-                if (lost_ > cfg_.target_unlock_frames || (t - last_target_ms_) > cfg_.target_stale_ms) {
+                const bool close_unlock_zone = last_area_ratio_ >= cfg_.close_unlock_area_ratio;
+                const int unlock_frames_limit = close_unlock_zone ? cfg_.target_unlock_frames_close : cfg_.target_unlock_frames;
+                const int stale_limit_ms = close_unlock_zone ? cfg_.target_stale_ms_close : cfg_.target_stale_ms;
+                const bool by_lost = lost_ > unlock_frames_limit;
+                const bool by_stale = (t - last_target_ms_) > stale_limit_ms;
+                if (by_lost || by_stale) {
+                    if (by_lost && by_stale) unlock_reason_ = close_unlock_zone ? "lost+stale_close" : "lost+stale";
+                    else if (by_lost) unlock_reason_ = close_unlock_zone ? "lost_frames_close" : "lost_frames";
+                    else unlock_reason_ = close_unlock_zone ? "target_stale_close" : "target_stale";
                     if (last_area_ratio_ >= cfg_.reacquire_min_area &&
                         std::abs(last_offset_) <= cfg_.reacquire_max_abs_offset) {
                         reacquire_hold_until_ms_ = t + cfg_.reacquire_hold_ms;
@@ -1137,6 +1190,8 @@ private:
                     search_hint_right_ = (last_offset_ >= 0.0);
                     search_hint_valid_ = true;
                     has_target_ = false;
+                    push_event("unlock reason=" + unlock_reason_ + " lost=" + std::to_string(lost_) +
+                               " ageMs=" + std::to_string(t - last_target_ms_));
                     decision_reason_ = "search:target_unlocked";
                 }
             }
@@ -1162,6 +1217,7 @@ private:
                     target_ = candidate_.value();
                     has_target_ = true;
                     lost_ = 0;
+                    unlock_reason_ = "none";
                     last_target_ms_ = t;
                     has_candidate_ = false;
                     candidate_count_ = 0;
@@ -1246,6 +1302,8 @@ private:
         const cv::Rect b = target_.bbox & cv::Rect(0, 0, frame.cols, frame.rows);
         if (b.width <= 1 || b.height <= 1) {
             has_target_ = false;
+            unlock_reason_ = "invalid_bbox";
+            push_event("unlock reason=invalid_bbox");
             decision_reason_ = "search:invalid_bbox";
             return;
         }
@@ -1262,9 +1320,12 @@ private:
         const double turn_strong = close_track ? cfg_.turn_strong_close : cfg_.turn_strong;
         const double turn_flip = close_track ? cfg_.turn_flip_close : cfg_.turn_flip;
         const double abs_off = std::abs(offset);
-        const bool near_goal = (area >= cfg_.goal_near_area_ratio) &&
-                               (abs_off <= cfg_.goal_near_center_offset) &&
-                               (target_.conf >= cfg_.goal_near_conf_min);
+        const bool near_goal_base = (area >= cfg_.goal_near_area_ratio) &&
+                                    (abs_off <= cfg_.goal_near_center_offset) &&
+                                    (target_.conf >= cfg_.goal_near_conf_min);
+        const bool near_goal_force = (area >= cfg_.goal_near_force_area_ratio) &&
+                                     (abs_off <= cfg_.goal_near_force_offset);
+        const bool near_goal = near_goal_base || near_goal_force;
         if (area > cfg_.goal_area_ratio || near_goal) {
             if (pregoal_start_ == 0) pregoal_start_ = t;
             motion_.set_desired(RobotCmd::Stop);
@@ -1317,8 +1378,11 @@ private:
         } else if (turn_state_ > 0) {
             motion_.set_desired(RobotCmd::RotR);
             decision_reason_ = close_track ? "track:rot_r_close" : "track:rot_r";
-            } else {
-            if (target_.source == "fast") {
+        } else {
+            if (close_track && lost_ >= cfg_.close_blind_hold_lost_frames) {
+                motion_.set_desired(RobotCmd::Stop);
+                decision_reason_ = "track:close_blind_hold";
+            } else if (target_.source == "fast") {
                 const bool vlm_no_ball_recent = (last_vlm_no_ball_ms_ > 0) && ((t - last_vlm_no_ball_ms_) < cfg_.vlm_negative_hold_ms);
                 const bool fast_probe = fast_target_active_ &&
                                         fast_target_acquired_ms_ > 0 &&
@@ -1405,6 +1469,7 @@ private:
     }
 
     void draw(cv::Mat& frame, int64_t t) {
+        const int64_t vlm_fresh_ms = (last_vlm_rx_ms_ > 0) ? (t - last_vlm_rx_ms_) : -1;
         if (has_target_) {
             const cv::Scalar c = target_.source == "vlm" ? cv::Scalar(40, 220, 40) : cv::Scalar(0, 180, 255);
             cv::rectangle(frame, target_.bbox, c, 2);
@@ -1418,8 +1483,9 @@ private:
                          " src=" + (has_target_ ? target_.source : "none") + " conf=" + fmt_double(has_target_ ? target_.conf : 0.0, 2) +
                          " off=" + fmt_double(last_offset_, 3) + " area=" + fmt_double(last_area_ratio_, 3) + " lost=" + std::to_string(lost_), cv::Scalar(180, 240, 240)});
         lines.push_back({"vlm: ball=" + std::string(last_vlm_ball_ ? "1" : "0") + " conf=" + fmt_double(last_vlm_conf_, 2) +
-                         " ageMs=" + std::to_string((last_vlm_rx_ms_ > 0) ? (t - last_vlm_rx_ms_) : -1) +
+                         " vlmFreshMs=" + std::to_string(vlm_fresh_ms) +
                          " aiSeen=" + std::string(ai_confirm_recent_ ? "1" : "0"), cv::Scalar(200, 180, 255)});
+        lines.push_back({"unlock_reason: " + unlock_reason_, cv::Scalar(255, 210, 180)});
         lines.push_back({"fast: conf=" + fmt_double(last_fast_conf_, 2) +
                          " ageMs=" + std::to_string((last_fast_seen_ms_ > 0) ? (t - last_fast_seen_ms_) : -1), cv::Scalar(180, 220, 255)});
         lines.push_back({"stream: frameAgeMs=" + std::to_string(frame_age_ms_), cv::Scalar(180, 210, 255)});
@@ -1488,6 +1554,7 @@ private:
     int last_key_ = -1;
     std::string phase_ = "INIT";
     std::string decision_reason_ = "startup";
+    std::string unlock_reason_ = "none";
     std::string stuck_note_ = "n/a";
     int64_t last_vlm_rx_ms_ = 0;
     bool last_vlm_ball_ = false;

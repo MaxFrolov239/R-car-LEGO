@@ -58,6 +58,18 @@
 .\usb_cam_app.exe
 ```
 
+Для сборки + запуска + записи лога одной командой:
+
+```powershell
+.\build_and_run_log.bat
+```
+
+Что делает скрипт:
+- собирает проект через `.vscode/build_debug.cmd`;
+- запускает `usb_cam_app.exe`;
+- пишет лог в `logs\run_YYYY-MM-DD_HH-mm-ss.log`;
+- копирует этот же лог в `run_test.log` (последний прогон).
+
 ## 6) Управление
 
 - `Space` - AUTO ON/OFF

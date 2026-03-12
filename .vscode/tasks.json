@@ -13,6 +13,16 @@
         "isDefault": true
       },
       "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "Build + Run + Log (stable)",
+      "type": "shell",
+      "command": "${workspaceFolder}\\build_and_run_log.bat",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "test",
+      "problemMatcher": []
     }
   ]
 }
