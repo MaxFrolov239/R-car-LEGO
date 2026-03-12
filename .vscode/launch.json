@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run usb_cam_app.exe",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\usb_cam_app.exe",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [
+        {
+          "name": "PATH",
+          "value": "C:\\OpenCV-cuda\\install\\x64\\vc17\\bin;C:\\tools\\cudnn\\bin;C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6\\bin;${env:PATH}"
+        },
+        {
+          "name": "OPENCV_LOG_LEVEL",
+          "value": "ERROR"
+        }
+      ],
+      "console": "integratedTerminal",
+      "preLaunchTask": "Build USB Cam App"
+    }
+  ]
+}

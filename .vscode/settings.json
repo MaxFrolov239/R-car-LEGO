@@ -1,0 +1,5 @@
+{
+  "terminal.integrated.env.windows": {
+    "PATH": "C:\\OpenCV-cuda\\install\\x64\\vc17\\bin;C:\\tools\\cudnn\\bin;C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6\\bin;${env:PATH}"
+  }
+}
